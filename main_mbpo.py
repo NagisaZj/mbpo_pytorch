@@ -10,6 +10,7 @@ import logging
 import os
 import os.path as osp
 import json
+from tensorboardX import SummaryWriter
 
 from sac.replay_memory import ReplayMemory
 from sac.sac import SAC
@@ -17,6 +18,9 @@ from model import EnsembleDynamicsModel
 from predict_env import PredictEnv
 from sample_env import EnvSampler
 from tf_models.constructor import construct_model, format_samples_for_training
+import robosuite
+from robosuite.controllers import load_controller_config
+from robosuite.wrappers.gym_wrapper import GymWrapper
 
 
 def readParser():
@@ -101,6 +105,7 @@ def readParser():
 
 
 def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
+    writer = SummaryWriter("./logs/3")
     total_step = 0
     reward_sum = 0
     rollout_length = 1
@@ -132,6 +137,7 @@ def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
                 train_policy_steps += train_policy_repeats(args, total_step, train_policy_steps, cur_step, env_pool, model_pool, agent)
 
             total_step += 1
+            # print(total_step)
 
             if total_step % 1000 == 0:
                 '''
@@ -150,6 +156,8 @@ def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
                 # logger.record_tabular("sum_reward", sum_reward)
                 # logger.dump_tabular()
                 logging.info("Step Reward: " + str(total_step) + " " + str(sum_reward))
+                writer.add_scalar('episode_reward',sum_reward,
+                                  total_step)
                 # print(total_step, sum_reward)
 
 
@@ -263,7 +271,30 @@ def main(args=None):
         args = readParser()
 
     # Initial environment
-    env = gym.make(args.env_name)
+    if 'Lift' in args.env_name:
+        controller_config = load_controller_config(default_controller='JOINT_VELOCITY')
+        # if 'None' not in config.robot2:
+        #     robots = [config.robot1, config.robot2]
+        # else:
+        #     robots = [config.robot1]
+        env = robosuite.make(
+            'Lift',
+            robots=['Panda'],  # load a Sawyer robot and a Panda robot
+            gripper_types='PandaGripper',  # use default grippers per robot arm
+            controller_configs=controller_config,  # each arm is controlled using OSC
+            env_configuration="default",  # (two-arm envs only) arms face each other
+            has_renderer=False,  # no on-screen rendering
+            has_offscreen_renderer=False,  # no off-screen rendering
+            control_freq=20,  # 20 hz control for applied actions
+            horizon=500,  # each episode terminates after 200 steps
+            use_object_obs=True,  # provide object observations to agent
+            use_camera_obs=False,  # don't provide image observations to agent
+            reward_shaping=True,  # use a dense reward signal for learning
+            # get_info=True
+        )
+        env = GymWrapper(env)
+    else:
+        env = gym.make(args.env_name)
 
     # Set random seed
     torch.manual_seed(args.seed)

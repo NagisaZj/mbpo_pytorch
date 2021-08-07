@@ -48,6 +48,10 @@ class PredictEnv:
             done = ~not_done
             done = done[:, None]
             return done
+        else:
+            done = np.array([False]).repeat(len(obs))
+            done = done[:, None]
+            return done
 
     def _get_logprob(self, x, means, variances):
 

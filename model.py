@@ -8,6 +8,7 @@ import numpy as np
 import math
 import gzip
 import itertools
+from torch.nn import TransformerEncoderLayer, TransformerEncoder
 
 device = torch.device('cuda')
 
@@ -76,6 +77,26 @@ def init_weights(m):
         m.bias.data.fill_(0.0)
 
 
+class EnsembleRole(nn.Module):
+    def __init__(self,ensemble_size=7, n_agents=8,role_dim=3):
+        super(EnsembleRole, self).__init__()
+        self.n_agents = n_agents
+        self.role_dim = role_dim
+        self.ensemble_size = ensemble_size
+        self.role_nets=nn.ModuleList()
+        for i in range(self.ensemble_size):
+            self.role_nets.append(nn.Linear(self.n_agents, self.role_dim).to(device))
+
+
+    def forward(self):
+        output_list = []
+        agent_ids = torch.eye(self.n_agents, device=device)
+        for i in range(self.ensemble_size):
+            roles = self.role_nets[i](agent_ids)
+            output_list.append(torch.unsqueeze(roles,0))
+
+        return torch.cat(output_list,0) # [ensemble_size,n, role_size]
+
 class EnsembleFC(nn.Module):
     __constants__ = ['in_features', 'out_features']
     in_features: int
@@ -109,6 +130,95 @@ class EnsembleFC(nn.Module):
             self.in_features, self.out_features, self.bias is not None
         )
 
+class ModularEnsembleFC(nn.Module):
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    ensemble_size: int
+    weight: torch.Tensor
+
+    def __init__(self, in_features: int, out_features: int, ensemble_size: int, weight_decay: float = 0., bias: bool = True) -> None:
+        super(ModularEnsembleFC, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.ensemble_size = ensemble_size
+        self.weight = nn.Parameter(torch.Tensor(ensemble_size, in_features, out_features))
+        self.weight_decay = weight_decay
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(ensemble_size, out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        pass
+
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # x: [ensemble_size,batch_size,num_joints,obs_size]
+        outputs = []
+        for i in range(input.shape[2]):
+            w_times_x = torch.bmm(input[:,:,i,:], self.weight)
+            outputs.append( torch.unsqueeze(torch.add(w_times_x, self.bias[:, None, :]) ,2)) # w times x + b
+        return torch.cat(outputs,dim=2)
+
+
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
+
+class EnsembleTransformer(nn.Module):
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    ensemble_size: int
+    weight: torch.Tensor
+
+    def __init__(self, in_features: int, out_features: int, ensemble_size: int, weight_decay: float = 0., bias: bool = True) -> None:
+        super(EnsembleTransformer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.ensemble_size = ensemble_size
+        self.networks = nn.ModuleList()
+        for i in range(self.ensemble_size):
+            encoder_layers = TransformerEncoderLayer(self.in_features, 2, 256, 0.0)
+            self.networks.append(
+                TransformerEncoder(
+                    encoder_layers,
+                    3,
+                    norm=nn.LayerNorm(self.in_features) if 1 else None,
+                )
+            )
+        self.weight = nn.Parameter(torch.Tensor(ensemble_size, 256, out_features))
+        self.weight_decay = weight_decay
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(ensemble_size, out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        pass
+
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        outputs = []
+        # x: [ensemble_size,batch_size,num_joints,obs_size+1]
+        for i in range(self.ensemble_size):
+            this_input = torch.transpose(input[i,:,:,:],0,1)#[num_joints,batch_size,output_size]
+            # print('input shape',this_input.shape)
+            output = self.networks[i](this_input)#[num_joints,batch_size,output_size]
+            output = output.permute(1,0,2)#[batch_size,num_joints,output_size]
+            # print('output shape', output.shape)
+            outputs.append(torch.unsqueeze(output,0))
+
+        return torch.cat(outputs, dim=0)  # w times x + b
+
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
 
 class EnsembleModel(nn.Module):
     def __init__(self, state_size, action_size, reward_size, ensemble_size, hidden_size=200, learning_rate=1e-3, use_decay=False):
@@ -185,6 +295,263 @@ class EnsembleModel(nn.Module):
         #     if param.requires_grad:
         #         print(name, param.grad.shape, torch.mean(param.grad), param.grad.flatten()[:5])
         self.optimizer.step()
+
+class ModularEnsembleMessage(nn.Module):
+    def __init__(self, state_size, action_size, reward_size, ensemble_size, hidden_size=200, learning_rate=1e-3, use_decay=False):
+        super(ModularEnsembleMessage, self).__init__()
+        self.num_joints = 8
+        self.obs_dim = 14
+        self.hidden_size = hidden_size
+        self.nn1 = EnsembleFC(self.obs_dim + action_size+hidden_size, hidden_size, ensemble_size, weight_decay=0.000025)
+        self.nn2 = EnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.00005)
+        self.nn3 = EnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.000075)
+        self.nn4 = EnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.000075)
+        self.use_decay = use_decay
+
+        self.output_dim = state_size + reward_size
+        # Add variance output
+        self.nn5 = EnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.0001)
+
+
+        self.max_logvar = nn.Parameter((torch.ones((1, self.output_dim)).float() / 2).to(device), requires_grad=False)
+        self.min_logvar = nn.Parameter((-torch.ones((1, self.output_dim)).float() * 10).to(device), requires_grad=False)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        self.apply(init_weights)
+        self.swish = Swish()
+
+    def forward(self, x, ret_log_var=False):
+        message = torch.zeros([x.shape[0],x.shape[1],self.hidden_size]).to(device)
+        for i in range(self.num_joints):
+            input = torch.cat([x[:,:,i*self.obs_dim:(i+1)*self.obs_dim],message],dim=-1)
+            nn1_output = self.swish(self.nn1(input))
+            nn2_output = self.swish(self.nn2(nn1_output))
+            nn3_output = self.swish(self.nn3(nn2_output))
+            nn4_output = self.swish(self.nn4(nn3_output))
+            nn5_output = self.nn5(nn4_output)
+            message = nn5_output
+        return message
+
+
+
+
+    def train(self, loss):
+        self.optimizer.zero_grad()
+
+
+        loss.backward()
+        # for name, param in self.named_parameters():
+        #     if param.requires_grad:
+        #         print(name, param.grad.shape, torch.mean(param.grad), param.grad.flatten()[:5])
+        self.optimizer.step()
+
+
+class ModularEnsembleModel(nn.Module):
+    def __init__(self, state_size, action_size, reward_size, ensemble_size, hidden_size=200, learning_rate=1e-3,
+                 use_decay=False,single_state_size=None,num_joints=None):
+        super(ModularEnsembleModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.single_state_size = state_size // num_joints
+        self.state_size = state_size
+        self.num_joints = num_joints
+        self.ensemble_size = ensemble_size
+        self.nn1 = ModularEnsembleFC( single_state_size+1, hidden_size, ensemble_size, weight_decay=0.000025)
+        self.nn2 = EnsembleTransformer(hidden_size, hidden_size, ensemble_size, weight_decay=0.000025)
+        self.use_decay = use_decay
+
+        self.output_dim = single_state_size + reward_size
+        self.output_dim_real = state_size + reward_size
+        # Add variance output
+        self.nn5 = ModularEnsembleFC(hidden_size, self.output_dim * 2, ensemble_size, weight_decay=0.0001)
+
+        self.max_logvar = nn.Parameter((torch.ones((1, self.output_dim_real)).float() / 2).to(device), requires_grad=False)
+        self.min_logvar = nn.Parameter((-torch.ones((1, self.output_dim_real)).float() * 10).to(device), requires_grad=False)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        self.apply(init_weights)
+        self.swish = Swish()
+
+    def forward(self, x, ret_log_var=False):
+        state,action = x[...,:self.state_size],x[...,self.state_size:]
+        # x: [ensemble_size,batch_size,obs_size*num_joints]
+        # print(x.shape,state.shape,action.shape)
+        state=state.reshape([state.shape[0],state.shape[1],self.num_joints,-1])
+        action = action.reshape([action.shape[0],action.shape[1],self.num_joints,-1])
+        x=torch.cat([state,action],dim=-1)
+        # x: [ensemble_size,batch_size,num_joints,obs_size+1]
+        nn1_output = self.swish(self.nn1(x))
+        nn2_output = self.swish(self.nn2(nn1_output))
+        nn5_output = self.nn5(nn2_output)
+        next_states, rewards = nn5_output[...,:self.single_state_size*2],nn5_output[...,self.single_state_size*2:(self.single_state_size*2+2)]
+        next_states_mean,next_states_var = next_states[...,:self.single_state_size],next_states[...,self.single_state_size:]
+        rewards_mean, rewards_var = rewards[..., :1], rewards[...,1:]
+        next_states_mean = next_states_mean.reshape([next_states_mean.shape[0],next_states_mean.shape[1],-1])
+        next_states_var = next_states_var.reshape([next_states_var.shape[0], next_states_var.shape[1], -1])
+        rewards_mean =  rewards_mean[:,:,0,:]
+        rewards_var = rewards_var[:, :, 0, :]
+        # print(next_states.shape,rewards.shape,next_states_mean.shape,rewards_mean.shape)
+        nn5_output = torch.cat([next_states_mean,rewards_mean,next_states_var,rewards_var],2)
+        mean = nn5_output[:, :, :self.output_dim_real]
+
+        logvar = self.max_logvar - F.softplus(self.max_logvar - nn5_output[:, :, self.output_dim_real:])
+        logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
+
+        if ret_log_var:
+            return mean, logvar
+        else:
+            return mean, torch.exp(logvar)
+
+    def get_decay_loss(self):
+        decay_loss = 0.
+        for m in self.children():
+            if isinstance(m, EnsembleFC):
+                decay_loss += m.weight_decay * torch.sum(torch.square(m.weight)) / 2.
+                # print(m.weight.shape)
+                # print(m, decay_loss, m.weight_decay)
+        return decay_loss
+
+    def loss(self, mean, logvar, labels, inc_var_loss=True):
+        """
+        mean, logvar: Ensemble_size x N x dim
+        labels: N x dim
+        """
+        assert len(mean.shape) == len(logvar.shape) == len(labels.shape) == 3
+        # print(mean.shape,logvar.shape,labels.shape)
+        inv_var = torch.exp(-logvar)
+        if inc_var_loss:
+            # Average over batch and dim, sum over ensembles.
+            mse_loss = torch.mean(torch.mean(torch.pow(mean - labels, 2) * inv_var, dim=-1), dim=-1)
+            var_loss = torch.mean(torch.mean(logvar, dim=-1), dim=-1)
+            total_loss = torch.sum(mse_loss) + torch.sum(var_loss)
+        else:
+            mse_loss = torch.mean(torch.pow(mean - labels, 2), dim=(1, 2))
+            total_loss = torch.sum(mse_loss)
+        return total_loss, mse_loss
+
+    def train(self, loss):
+        self.optimizer.zero_grad()
+
+        loss += 0.01 * torch.sum(self.max_logvar) - 0.01 * torch.sum(self.min_logvar)
+        # print('loss:', loss.item())
+        if self.use_decay:
+            loss += self.get_decay_loss()
+        loss.backward()
+        # for name, param in self.named_parameters():
+        #     if param.requires_grad:
+        #         print(name, param.grad.shape, torch.mean(param.grad), param.grad.flatten()[:5])
+        self.optimizer.step()
+
+class RoleModularEnsembleModel(nn.Module):
+    def __init__(self, state_size, action_size, reward_size, ensemble_size, hidden_size=200, learning_rate=1e-3,
+                 use_decay=False,single_state_size=None,num_joints=None):
+        super(RoleModularEnsembleModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.single_state_size = state_size // num_joints
+        self.state_size = state_size
+        self.num_joints = num_joints
+        self.ensemble_size = ensemble_size
+        self.role_generator = EnsembleRole(ensemble_size=self.ensemble_size, n_agents=self.num_joints,role_dim=3)
+        self.encoder_net = EnsembleFC(3, hidden_size * ( single_state_size+1), ensemble_size, weight_decay=0.000025)
+        # self.nn1 = ModularEnsembleFC( single_state_size+1, hidden_size, ensemble_size, weight_decay=0.000025)
+        self.nn2 = EnsembleTransformer(hidden_size, hidden_size, ensemble_size, weight_decay=0.000025)
+        self.use_decay = use_decay
+
+        self.output_dim = single_state_size + reward_size
+        self.output_dim_real = state_size + reward_size
+        # Add variance output
+        self.decoder_net = EnsembleFC(3, hidden_size * (single_state_size + 1)*2, ensemble_size, weight_decay=0.000025)
+        # self.nn5 = ModularEnsembleFC(hidden_size, self.output_dim * 2, ensemble_size, weight_decay=0.0001)
+
+        self.max_logvar = nn.Parameter((torch.ones((1, self.output_dim_real)).float() / 2).to(device), requires_grad=False)
+        self.min_logvar = nn.Parameter((-torch.ones((1, self.output_dim_real)).float() * 10).to(device), requires_grad=False)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        self.apply(init_weights)
+        self.swish = Swish()
+
+    def forward(self, x, ret_log_var=False):
+        state,action = x[...,:self.state_size],x[...,self.state_size:]
+        # x: [ensemble_size,batch_size,(obs_size+1)*num_joints]
+        # print(x.shape,state.shape,action.shape)
+        state=state.reshape([state.shape[0],state.shape[1],self.num_joints,-1])
+        action = action.reshape([action.shape[0],action.shape[1],self.num_joints,-1])
+        x=torch.cat([state,action],dim=-1)
+        # x: [ensemble_size,batch_size,num_joints,obs_size+1]
+        roles = self.role_generator.forward()#[ensemble_size,num_joints,role_size]
+        encoder_params = self.encoder_net(roles).reshape(self.ensemble_size,self.num_joints,self.single_state_size+1,self.hidden_size) # [ensemble_size,num_joints,obs_size+1,hidden_size]
+        x=x.unsqueeze(3)
+        encoder_params = encoder_params.unsqueeze(1)# [ensemble_size,1,num_joints,obs_size+1,hidden_size]
+        nn1_output = torch.matmul(x,encoder_params)# [ensemble_size,batch_size,num_joints,hidden_size]
+        # print(x.shape,encoder_params.shape,nn1_output.shape)
+        nn1_output = nn1_output.squeeze(3)
+        # x: [ensemble_size,batch_size,num_joints,obs_size+1]
+        # nn1_output = self.swish(self.nn1(x))
+        nn2_output = self.nn2(nn1_output)
+
+        decoder_params = self.decoder_net(roles).reshape(self.ensemble_size, self.num_joints, self.hidden_size,
+                                                         -1)  # [ensemble_size,num_joints,hidden_size,output_size]
+        nn2_output = nn2_output.unsqueeze(3)
+        decoder_params = decoder_params.unsqueeze(1)  # [ensemble_size,1,num_joints,hidden_size,output_size]
+        nn5_output = torch.matmul(nn2_output, decoder_params)  # [ensemble_size,batch_size,num_joints,output_size]
+        # print(nn2_output.shape, decoder_params.shape, nn5_output.shape)
+        nn5_output = nn5_output.squeeze(3)
+
+        next_states, rewards = nn5_output[...,:self.single_state_size*2],nn5_output[...,self.single_state_size*2:(self.single_state_size*2+2)]
+        next_states_mean,next_states_var = next_states[...,:self.single_state_size],next_states[...,self.single_state_size:]
+        rewards_mean, rewards_var = rewards[..., :1], rewards[...,1:]
+        next_states_mean = next_states_mean.reshape([next_states_mean.shape[0],next_states_mean.shape[1],-1])
+        next_states_var = next_states_var.reshape([next_states_var.shape[0], next_states_var.shape[1], -1])
+        rewards_mean =  rewards_mean[:,:,0,:]
+        rewards_var = rewards_var[:, :, 0, :]
+        # print(next_states.shape,rewards.shape,next_states_mean.shape,rewards_mean.shape)
+        nn5_output = torch.cat([next_states_mean,rewards_mean,next_states_var,rewards_var],2)
+        mean = nn5_output[:, :, :self.output_dim_real]
+
+        logvar = self.max_logvar - F.softplus(self.max_logvar - nn5_output[:, :, self.output_dim_real:])
+        logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
+
+        if ret_log_var:
+            return mean, logvar
+        else:
+            return mean, torch.exp(logvar)
+
+    def get_decay_loss(self):
+        decay_loss = 0.
+        for m in self.children():
+            if isinstance(m, EnsembleFC):
+                decay_loss += m.weight_decay * torch.sum(torch.square(m.weight)) / 2.
+                # print(m.weight.shape)
+                # print(m, decay_loss, m.weight_decay)
+        return decay_loss
+
+    def loss(self, mean, logvar, labels, inc_var_loss=True):
+        """
+        mean, logvar: Ensemble_size x N x dim
+        labels: N x dim
+        """
+        assert len(mean.shape) == len(logvar.shape) == len(labels.shape) == 3
+        # print(mean.shape,logvar.shape,labels.shape)
+        inv_var = torch.exp(-logvar)
+        if inc_var_loss:
+            # Average over batch and dim, sum over ensembles.
+            mse_loss = torch.mean(torch.mean(torch.pow(mean - labels, 2) * inv_var, dim=-1), dim=-1)
+            var_loss = torch.mean(torch.mean(logvar, dim=-1), dim=-1)
+            total_loss = torch.sum(mse_loss) + torch.sum(var_loss)
+        else:
+            mse_loss = torch.mean(torch.pow(mean - labels, 2), dim=(1, 2))
+            total_loss = torch.sum(mse_loss)
+        return total_loss, mse_loss
+
+    def train(self, loss):
+        self.optimizer.zero_grad()
+
+        loss += 0.01 * torch.sum(self.max_logvar) - 0.01 * torch.sum(self.min_logvar)
+        # print('loss:', loss.item())
+        if self.use_decay:
+            loss += self.get_decay_loss()
+        loss.backward()
+        # for name, param in self.named_parameters():
+        #     if param.requires_grad:
+        #         print(name, param.grad.shape, torch.mean(param.grad), param.grad.flatten()[:5])
+        self.optimizer.step()
+
 
 
 class EnsembleDynamicsModel():
@@ -287,6 +654,212 @@ class EnsembleDynamicsModel():
             var = torch.mean(ensemble_var, dim=0) + torch.mean(torch.square(ensemble_mean - mean[None, :, :]), dim=0)
             return mean, var
 
+
+class ModularEnsembleDynamicsModel():
+    def __init__(self, network_size, elite_size, state_size, action_size, reward_size=1, hidden_size=200, use_decay=False,num_joints = 8):
+        self.network_size = network_size
+        self.elite_size = elite_size
+        self.model_list = []
+        self.state_size = state_size
+        self.action_size = action_size
+        self.reward_size = reward_size
+        self.network_size = network_size
+        self.elite_model_idxes = []
+        self.num_joints = num_joints
+        self.single_state_size = self.state_size // self.num_joints
+
+        self.ensemble_model = ModularEnsembleModel(state_size, action_size, reward_size, network_size, hidden_size, use_decay=use_decay,single_state_size=self.single_state_size,num_joints=self.num_joints)
+        self.scaler = StandardScaler()
+
+    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5):
+        self._max_epochs_since_update = max_epochs_since_update
+        self._epochs_since_update = 0
+        self._state = {}
+        self._snapshots = {i: (None, 1e10) for i in range(self.network_size)}
+
+        num_holdout = int(inputs.shape[0] * holdout_ratio)
+        permutation = np.random.permutation(inputs.shape[0])
+        inputs, labels = inputs[permutation], labels[permutation]
+
+        train_inputs, train_labels = inputs[num_holdout:], labels[num_holdout:]
+        holdout_inputs, holdout_labels = inputs[:num_holdout], labels[:num_holdout]
+
+        self.scaler.fit(train_inputs)
+        train_inputs = self.scaler.transform(train_inputs)
+        holdout_inputs = self.scaler.transform(holdout_inputs)
+
+        holdout_inputs = torch.from_numpy(holdout_inputs).float().to(device)
+        holdout_labels = torch.from_numpy(holdout_labels).float().to(device)
+        holdout_inputs = holdout_inputs[None, :, :].repeat([self.network_size, 1, 1])
+        holdout_labels = holdout_labels[None, :, :].repeat([self.network_size, 1, 1])
+
+        for epoch in itertools.count():
+
+            train_idx = np.vstack([np.random.permutation(train_inputs.shape[0]) for _ in range(self.network_size)])
+            # train_idx = np.vstack([np.arange(train_inputs.shape[0])] for _ in range(self.network_size))
+            for start_pos in range(0, train_inputs.shape[0], batch_size):
+                idx = train_idx[:, start_pos: start_pos + batch_size]
+                train_input = torch.from_numpy(train_inputs[idx]).float().to(device)
+                train_label = torch.from_numpy(train_labels[idx]).float().to(device)
+                losses = []
+                mean, logvar = self.ensemble_model(train_input, ret_log_var=True)
+                loss, _ = self.ensemble_model.loss(mean, logvar, train_label)
+                self.ensemble_model.train(loss)
+                losses.append(loss)
+
+            with torch.no_grad():
+                holdout_mean, holdout_logvar = self.ensemble_model(holdout_inputs, ret_log_var=True)
+                _, holdout_mse_losses = self.ensemble_model.loss(holdout_mean, holdout_logvar, holdout_labels, inc_var_loss=False)
+                holdout_mse_losses = holdout_mse_losses.detach().cpu().numpy()
+                sorted_loss_idx = np.argsort(holdout_mse_losses)
+                self.elite_model_idxes = sorted_loss_idx[:self.elite_size].tolist()
+                break_train = self._save_best(epoch, holdout_mse_losses)
+                if break_train:
+                    break
+            print('epoch: {}, holdout mse losses: {}'.format(epoch, holdout_mse_losses))
+
+    def _save_best(self, epoch, holdout_losses):
+        updated = False
+        for i in range(len(holdout_losses)):
+            current = holdout_losses[i]
+            _, best = self._snapshots[i]
+            improvement = (best - current) / best
+            if improvement > 0.01:
+                self._snapshots[i] = (epoch, current)
+                # self._save_state(i)
+                updated = True
+                # improvement = (best - current) / best
+
+        if updated:
+            self._epochs_since_update = 0
+        else:
+            self._epochs_since_update += 1
+        if self._epochs_since_update > self._max_epochs_since_update:
+            return True
+        else:
+            return False
+
+    def predict(self, inputs, batch_size=1024, factored=True):
+        inputs = self.scaler.transform(inputs)
+        ensemble_mean, ensemble_var = [], []
+        for i in range(0, inputs.shape[0], batch_size):
+            input = torch.from_numpy(inputs[i:min(i + batch_size, inputs.shape[0])]).float().to(device)
+            b_mean, b_var = self.ensemble_model(input[None, :, :].repeat([self.network_size, 1, 1]), ret_log_var=False)
+            ensemble_mean.append(b_mean.detach().cpu().numpy())
+            ensemble_var.append(b_var.detach().cpu().numpy())
+        ensemble_mean = np.hstack(ensemble_mean)
+        ensemble_var = np.hstack(ensemble_var)
+
+        if factored:
+            return ensemble_mean, ensemble_var
+        else:
+            assert False, "Need to transform to numpy"
+            mean = torch.mean(ensemble_mean, dim=0)
+            var = torch.mean(ensemble_var, dim=0) + torch.mean(torch.square(ensemble_mean - mean[None, :, :]), dim=0)
+            return mean, var
+
+class RoleModularEnsembleDynamicsModel():
+    def __init__(self, network_size, elite_size, state_size, action_size, reward_size=1, hidden_size=200, use_decay=False,num_joints = 8):
+        self.network_size = network_size
+        self.elite_size = elite_size
+        self.model_list = []
+        self.state_size = state_size
+        self.action_size = action_size
+        self.reward_size = reward_size
+        self.network_size = network_size
+        self.elite_model_idxes = []
+        self.num_joints = num_joints
+        self.single_state_size = self.state_size // self.num_joints
+
+        self.ensemble_model = RoleModularEnsembleModel(state_size, action_size, reward_size, network_size, hidden_size, use_decay=use_decay,single_state_size=self.single_state_size,num_joints=self.num_joints)
+        self.scaler = StandardScaler()
+
+    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5):
+        self._max_epochs_since_update = max_epochs_since_update
+        self._epochs_since_update = 0
+        self._state = {}
+        self._snapshots = {i: (None, 1e10) for i in range(self.network_size)}
+
+        num_holdout = int(inputs.shape[0] * holdout_ratio)
+        permutation = np.random.permutation(inputs.shape[0])
+        inputs, labels = inputs[permutation], labels[permutation]
+
+        train_inputs, train_labels = inputs[num_holdout:], labels[num_holdout:]
+        holdout_inputs, holdout_labels = inputs[:num_holdout], labels[:num_holdout]
+
+        self.scaler.fit(train_inputs)
+        train_inputs = self.scaler.transform(train_inputs)
+        holdout_inputs = self.scaler.transform(holdout_inputs)
+
+        holdout_inputs = torch.from_numpy(holdout_inputs).float().to(device)
+        holdout_labels = torch.from_numpy(holdout_labels).float().to(device)
+        holdout_inputs = holdout_inputs[None, :, :].repeat([self.network_size, 1, 1])
+        holdout_labels = holdout_labels[None, :, :].repeat([self.network_size, 1, 1])
+
+        for epoch in itertools.count():
+
+            train_idx = np.vstack([np.random.permutation(train_inputs.shape[0]) for _ in range(self.network_size)])
+            # train_idx = np.vstack([np.arange(train_inputs.shape[0])] for _ in range(self.network_size))
+            for start_pos in range(0, train_inputs.shape[0], batch_size):
+                idx = train_idx[:, start_pos: start_pos + batch_size]
+                train_input = torch.from_numpy(train_inputs[idx]).float().to(device)
+                train_label = torch.from_numpy(train_labels[idx]).float().to(device)
+                losses = []
+                mean, logvar = self.ensemble_model(train_input, ret_log_var=True)
+                loss, _ = self.ensemble_model.loss(mean, logvar, train_label)
+                self.ensemble_model.train(loss)
+                losses.append(loss)
+
+            with torch.no_grad():
+                holdout_mean, holdout_logvar = self.ensemble_model(holdout_inputs, ret_log_var=True)
+                _, holdout_mse_losses = self.ensemble_model.loss(holdout_mean, holdout_logvar, holdout_labels, inc_var_loss=False)
+                holdout_mse_losses = holdout_mse_losses.detach().cpu().numpy()
+                sorted_loss_idx = np.argsort(holdout_mse_losses)
+                self.elite_model_idxes = sorted_loss_idx[:self.elite_size].tolist()
+                break_train = self._save_best(epoch, holdout_mse_losses)
+                if break_train:
+                    break
+            print('epoch: {}, holdout mse losses: {}'.format(epoch, holdout_mse_losses))
+
+    def _save_best(self, epoch, holdout_losses):
+        updated = False
+        for i in range(len(holdout_losses)):
+            current = holdout_losses[i]
+            _, best = self._snapshots[i]
+            improvement = (best - current) / best
+            if improvement > 0.01:
+                self._snapshots[i] = (epoch, current)
+                # self._save_state(i)
+                updated = True
+                # improvement = (best - current) / best
+
+        if updated:
+            self._epochs_since_update = 0
+        else:
+            self._epochs_since_update += 1
+        if self._epochs_since_update > self._max_epochs_since_update:
+            return True
+        else:
+            return False
+
+    def predict(self, inputs, batch_size=1024, factored=True):
+        inputs = self.scaler.transform(inputs)
+        ensemble_mean, ensemble_var = [], []
+        for i in range(0, inputs.shape[0], batch_size):
+            input = torch.from_numpy(inputs[i:min(i + batch_size, inputs.shape[0])]).float().to(device)
+            b_mean, b_var = self.ensemble_model(input[None, :, :].repeat([self.network_size, 1, 1]), ret_log_var=False)
+            ensemble_mean.append(b_mean.detach().cpu().numpy())
+            ensemble_var.append(b_var.detach().cpu().numpy())
+        ensemble_mean = np.hstack(ensemble_mean)
+        ensemble_var = np.hstack(ensemble_var)
+
+        if factored:
+            return ensemble_mean, ensemble_var
+        else:
+            assert False, "Need to transform to numpy"
+            mean = torch.mean(ensemble_mean, dim=0)
+            var = torch.mean(ensemble_var, dim=0) + torch.mean(torch.square(ensemble_mean - mean[None, :, :]), dim=0)
+            return mean, var
 
 class Swish(nn.Module):
     def __init__(self):
