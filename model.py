@@ -78,24 +78,30 @@ def init_weights(m):
 
 
 class EnsembleRole(nn.Module):
-    def __init__(self,ensemble_size=7, n_agents=8,role_dim=3):
+    def __init__(self,ensemble_size=7, n_agents=8,role_dim=3,bias=False):
         super(EnsembleRole, self).__init__()
         self.n_agents = n_agents
         self.role_dim = role_dim
         self.ensemble_size = ensemble_size
-        self.role_nets=nn.ModuleList()
-        for i in range(self.ensemble_size):
-            self.role_nets.append(nn.Linear(self.n_agents, self.role_dim).to(device))
+        self.role_nets = nn.Parameter(torch.Tensor(ensemble_size, self.n_agents, self.role_dim))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(ensemble_size, self.role_dim))
+        # self.role_nets=nn.ModuleList()
+        # for i in range(self.ensemble_size):
+        #     self.role_nets.append(nn.Linear(self.n_agents, self.role_dim).to(device))
 
 
     def forward(self):
-        output_list = []
         agent_ids = torch.eye(self.n_agents, device=device)
-        for i in range(self.ensemble_size):
-            roles = self.role_nets[i](agent_ids)
-            output_list.append(torch.unsqueeze(roles,0))
-
-        return torch.cat(output_list,0) # [ensemble_size,n, role_size]
+        w_times_x = torch.matmul(torch.unsqueeze(agent_ids,0), self.role_nets)
+        return torch.add(w_times_x, self.bias[:, None, :])
+        # output_list = []
+        # agent_ids = torch.eye(self.n_agents, device=device)
+        # for i in range(self.ensemble_size):
+        #     roles = self.role_nets[i](agent_ids)
+        #     output_list.append(torch.unsqueeze(roles,0))
+        #
+        # return torch.cat(output_list,0) # [ensemble_size,n, role_size]
 
 class EnsembleFC(nn.Module):
     __constants__ = ['in_features', 'out_features']
@@ -156,11 +162,9 @@ class ModularEnsembleFC(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # x: [ensemble_size,batch_size,num_joints,obs_size]
-        outputs = []
-        for i in range(input.shape[2]):
-            w_times_x = torch.bmm(input[:,:,i,:], self.weight)
-            outputs.append( torch.unsqueeze(torch.add(w_times_x, self.bias[:, None, :]) ,2)) # w times x + b
-        return torch.cat(outputs,dim=2)
+        w_times_x = torch.matmul(input,self.weight.unsqueeze(1))
+        outputs = torch.add(w_times_x,torch.unsqueeze(self.bias.unsqueeze(1),1))
+        return outputs
 
 
     def extra_repr(self) -> str:
@@ -182,7 +186,7 @@ class EnsembleTransformer(nn.Module):
         self.ensemble_size = ensemble_size
         self.networks = nn.ModuleList()
         for i in range(self.ensemble_size):
-            encoder_layers = TransformerEncoderLayer(self.in_features, 2, 256, 0.0)
+            encoder_layers = TransformerEncoderLayer(self.in_features, 2, 32, 0.0)
             self.networks.append(
                 TransformerEncoder(
                     encoder_layers,
@@ -190,8 +194,6 @@ class EnsembleTransformer(nn.Module):
                     norm=nn.LayerNorm(self.in_features) if 1 else None,
                 )
             )
-        self.weight = nn.Parameter(torch.Tensor(ensemble_size, 256, out_features))
-        self.weight_decay = weight_decay
         if bias:
             self.bias = nn.Parameter(torch.Tensor(ensemble_size, out_features))
         else:
@@ -356,6 +358,7 @@ class ModularEnsembleModel(nn.Module):
         self.ensemble_size = ensemble_size
         self.nn1 = ModularEnsembleFC( single_state_size+1, hidden_size, ensemble_size, weight_decay=0.000025)
         self.nn2 = EnsembleTransformer(hidden_size, hidden_size, ensemble_size, weight_decay=0.000025)
+        # self.nn2 = ModularEnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.000025)
         self.use_decay = use_decay
 
         self.output_dim = single_state_size + reward_size
@@ -448,8 +451,9 @@ class RoleModularEnsembleModel(nn.Module):
         self.state_size = state_size
         self.num_joints = num_joints
         self.ensemble_size = ensemble_size
-        self.role_generator = EnsembleRole(ensemble_size=self.ensemble_size, n_agents=self.num_joints,role_dim=3)
-        self.encoder_net = EnsembleFC(3, hidden_size * ( single_state_size+1), ensemble_size, weight_decay=0.000025)
+        role_dim = 16
+        self.role_generator = EnsembleRole(ensemble_size=self.ensemble_size, n_agents=self.num_joints,role_dim=role_dim)
+        self.encoder_net = EnsembleFC(role_dim, hidden_size * ( single_state_size+1), ensemble_size, weight_decay=0.000025)
         # self.nn1 = ModularEnsembleFC( single_state_size+1, hidden_size, ensemble_size, weight_decay=0.000025)
         self.nn2 = EnsembleTransformer(hidden_size, hidden_size, ensemble_size, weight_decay=0.000025)
         self.use_decay = use_decay
@@ -457,7 +461,7 @@ class RoleModularEnsembleModel(nn.Module):
         self.output_dim = single_state_size + reward_size
         self.output_dim_real = state_size + reward_size
         # Add variance output
-        self.decoder_net = EnsembleFC(3, hidden_size * (single_state_size + 1)*2, ensemble_size, weight_decay=0.000025)
+        self.decoder_net = EnsembleFC(role_dim, hidden_size * (single_state_size + 1)*2, ensemble_size, weight_decay=0.000025)
         # self.nn5 = ModularEnsembleFC(hidden_size, self.output_dim * 2, ensemble_size, weight_decay=0.0001)
 
         self.max_logvar = nn.Parameter((torch.ones((1, self.output_dim_real)).float() / 2).to(device), requires_grad=False)
@@ -482,7 +486,7 @@ class RoleModularEnsembleModel(nn.Module):
         # print(x.shape,encoder_params.shape,nn1_output.shape)
         nn1_output = nn1_output.squeeze(3)
         # x: [ensemble_size,batch_size,num_joints,obs_size+1]
-        # nn1_output = self.swish(self.nn1(x))
+        nn1_output = self.swish(nn1_output)
         nn2_output = self.nn2(nn1_output)
 
         decoder_params = self.decoder_net(roles).reshape(self.ensemble_size, self.num_joints, self.hidden_size,
@@ -567,7 +571,7 @@ class EnsembleDynamicsModel():
         self.ensemble_model = EnsembleModel(state_size, action_size, reward_size, network_size, hidden_size, use_decay=use_decay)
         self.scaler = StandardScaler()
 
-    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5):
+    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5,epoch_step=None,cur_step=None,writer=None):
         self._max_epochs_since_update = max_epochs_since_update
         self._epochs_since_update = 0
         self._state = {}
@@ -613,6 +617,12 @@ class EnsembleDynamicsModel():
                 if break_train:
                     break
             print('epoch: {}, holdout mse losses: {}'.format(epoch, holdout_mse_losses))
+        writer.add_scalar('episode_model_counts', epoch,
+                          cur_step)
+        for i in range(len(holdout_mse_losses)):
+            _, best = self._snapshots[i]
+            writer.add_scalar('best mse loss%d'%i, best,
+                            cur_step)
 
     def _save_best(self, epoch, holdout_losses):
         updated = False
@@ -671,7 +681,7 @@ class ModularEnsembleDynamicsModel():
         self.ensemble_model = ModularEnsembleModel(state_size, action_size, reward_size, network_size, hidden_size, use_decay=use_decay,single_state_size=self.single_state_size,num_joints=self.num_joints)
         self.scaler = StandardScaler()
 
-    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5):
+    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5,epoch_step=None,cur_step=None,writer=None):
         self._max_epochs_since_update = max_epochs_since_update
         self._epochs_since_update = 0
         self._state = {}
@@ -717,6 +727,12 @@ class ModularEnsembleDynamicsModel():
                 if break_train:
                     break
             print('epoch: {}, holdout mse losses: {}'.format(epoch, holdout_mse_losses))
+        writer.add_scalar('episode_model_counts', epoch,
+                          cur_step)
+        for i in range(len(holdout_mse_losses)):
+            _, best = self._snapshots[i]
+            writer.add_scalar('best mse loss%d'%i, best,
+                            cur_step)
 
     def _save_best(self, epoch, holdout_losses):
         updated = False
@@ -774,7 +790,7 @@ class RoleModularEnsembleDynamicsModel():
         self.ensemble_model = RoleModularEnsembleModel(state_size, action_size, reward_size, network_size, hidden_size, use_decay=use_decay,single_state_size=self.single_state_size,num_joints=self.num_joints)
         self.scaler = StandardScaler()
 
-    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5):
+    def train(self, inputs, labels, batch_size=256, holdout_ratio=0., max_epochs_since_update=5,epoch_step=None,cur_step=None,writer=None):
         self._max_epochs_since_update = max_epochs_since_update
         self._epochs_since_update = 0
         self._state = {}
@@ -820,6 +836,12 @@ class RoleModularEnsembleDynamicsModel():
                 if break_train:
                     break
             print('epoch: {}, holdout mse losses: {}'.format(epoch, holdout_mse_losses))
+        writer.add_scalar('episode_model_counts', epoch,
+                          cur_step)
+        for i in range(len(holdout_mse_losses)):
+            _, best = self._snapshots[i]
+            writer.add_scalar('best mse loss%d'%i, best,
+                            cur_step)
 
     def _save_best(self, epoch, holdout_losses):
         updated = False

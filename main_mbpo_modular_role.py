@@ -56,7 +56,7 @@ def readParser():
                         help='ensemble size (default: 7)')
     parser.add_argument('--num_elites', type=int, default=5, metavar='E',
                         help='elite size (default: 5)')
-    parser.add_argument('--pred_hidden_size', type=int, default=50, metavar='E',
+    parser.add_argument('--pred_hidden_size', type=int, default=200, metavar='E',
                         help='hidden size for predictive model')
     parser.add_argument('--reward_size', type=int, default=1, metavar='E',
                         help='environment reward size')
@@ -106,7 +106,7 @@ def readParser():
 
 
 def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
-    writer = SummaryWriter("./logs/modular-role/1")
+    writer = SummaryWriter("./logs/modular-role/28")
     total_step = 0
     reward_sum = 0
     rollout_length = 1
@@ -122,7 +122,7 @@ def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
                 break
 
             if cur_step > 0 and cur_step % args.model_train_freq == 0 and args.real_ratio < 1.0:
-                train_predict_model(args, env_pool, predict_env)
+                train_predict_model(args, env_pool, predict_env,epoch_step,cur_step+start_step,writer)
 
                 new_rollout_length = set_rollout_length(args, epoch_step)
                 if rollout_length != new_rollout_length:
@@ -175,14 +175,14 @@ def set_rollout_length(args, epoch_step):
     return int(rollout_length)
 
 
-def train_predict_model(args, env_pool, predict_env):
+def train_predict_model(args, env_pool, predict_env,epoch_step,cur_step,writer):
     # Get all samples from environment
     state, action, reward, next_state, done = env_pool.sample(len(env_pool))
     delta_state = next_state - state
     inputs = np.concatenate((state, action), axis=-1)
     labels = np.concatenate((np.reshape(reward, (reward.shape[0], -1)), delta_state), axis=-1)
 
-    predict_env.model.train(inputs, labels, batch_size=256, holdout_ratio=0.2)
+    predict_env.model.train(inputs, labels, batch_size=256, holdout_ratio=0.2,epoch_step=epoch_step,cur_step=cur_step,writer=writer)
 
 
 def resize_model_pool(args, rollout_length, model_pool):
@@ -293,7 +293,7 @@ def main(args=None):
             reward_shaping=True,  # use a dense reward signal for learning
             # get_info=True
         )
-        env.get_info = True
+        # env.get_info = True
         env = RobosuiteWrapper(env,7,True)
     else:
         env = gym.make(args.env_name)
@@ -312,6 +312,9 @@ def main(args=None):
     if args.model_type == 'pytorch':
         env_model = RoleModularEnsembleDynamicsModel(args.num_networks, args.num_elites, state_size, action_size, args.reward_size, args.pred_hidden_size,
                                           use_decay=args.use_decay,num_joints = 8)
+        # env_model = EnsembleDynamicsModel(args.num_networks, args.num_elites, state_size, action_size,
+        #                                              args.reward_size, args.pred_hidden_size,
+        #                                              use_decay=args.use_decay)
     else:
         env_model = construct_model(obs_dim=state_size, act_dim=action_size, hidden_dim=args.pred_hidden_size, num_networks=args.num_networks,
                                     num_elites=args.num_elites)

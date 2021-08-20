@@ -106,7 +106,7 @@ def readParser():
 
 
 def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
-    writer = SummaryWriter("./logs/modular/3")
+    writer = SummaryWriter("./logs/modular/7")
     total_step = 0
     reward_sum = 0
     rollout_length = 1
@@ -122,7 +122,7 @@ def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
                 break
 
             if cur_step > 0 and cur_step % args.model_train_freq == 0 and args.real_ratio < 1.0:
-                train_predict_model(args, env_pool, predict_env)
+                train_predict_model(args, env_pool, predict_env,epoch_step,cur_step+start_step,writer)
 
                 new_rollout_length = set_rollout_length(args, epoch_step)
                 if rollout_length != new_rollout_length:
@@ -175,14 +175,15 @@ def set_rollout_length(args, epoch_step):
     return int(rollout_length)
 
 
-def train_predict_model(args, env_pool, predict_env):
+def train_predict_model(args, env_pool, predict_env,epoch_step,cur_step,writer):
     # Get all samples from environment
     state, action, reward, next_state, done = env_pool.sample(len(env_pool))
     delta_state = next_state - state
     inputs = np.concatenate((state, action), axis=-1)
     labels = np.concatenate((np.reshape(reward, (reward.shape[0], -1)), delta_state), axis=-1)
 
-    predict_env.model.train(inputs, labels, batch_size=256, holdout_ratio=0.2)
+    predict_env.model.train(inputs, labels, batch_size=256, holdout_ratio=0.2,epoch_step=epoch_step,cur_step=cur_step,writer=writer)
+
 
 
 def resize_model_pool(args, rollout_length, model_pool):
