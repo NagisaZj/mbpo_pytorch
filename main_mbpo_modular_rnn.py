@@ -4,7 +4,6 @@ import gym
 import torch
 import numpy as np
 from itertools import count
-from envs.robosuite_wrapper import RobosuiteWrapper
 
 import logging
 
@@ -15,13 +14,14 @@ from tensorboardX import SummaryWriter
 
 from sac.replay_memory import ReplayMemory
 from sac.sac import SAC
-from model import EnsembleDynamicsModel
+from model import EnsembleDynamicsModel, ModularEnsembleDynamicsModel, ModularEnsembleRNNDynamicsModel
 from predict_env import PredictEnv
 from sample_env import EnvSampler
 from tf_models.constructor import construct_model, format_samples_for_training
 import robosuite
 from robosuite.controllers import load_controller_config
 from robosuite.wrappers.gym_wrapper import GymWrapper
+from envs.robosuite_wrapper import RobosuiteWrapper
 
 
 def readParser():
@@ -106,7 +106,7 @@ def readParser():
 
 
 def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
-    writer = SummaryWriter("./logs/10")
+    writer = SummaryWriter("./logs/modularRNN/3")
     total_step = 0
     reward_sum = 0
     rollout_length = 1
@@ -183,6 +183,7 @@ def train_predict_model(args, env_pool, predict_env,epoch_step,cur_step,writer):
     labels = np.concatenate((np.reshape(reward, (reward.shape[0], -1)), delta_state), axis=-1)
 
     predict_env.model.train(inputs, labels, batch_size=256, holdout_ratio=0.2,epoch_step=epoch_step,cur_step=cur_step,writer=writer)
+
 
 
 def resize_model_pool(args, rollout_length, model_pool):
@@ -293,15 +294,15 @@ def main(args=None):
             reward_shaping=True,  # use a dense reward signal for learning
             # get_info=True
         )
-        env = GymWrapper(env)
-        # env = RobosuiteWrapper(env, 7, True)
+        env.get_info = True
+        env = RobosuiteWrapper(env,7,True)
     else:
         env = gym.make(args.env_name)
 
     # Set random seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    env.seed(args.seed)
+    # env.seed(args.seed)
 
     # Intial agent
     agent = SAC(env.observation_space.shape[0], env.action_space, args)
@@ -310,8 +311,8 @@ def main(args=None):
     state_size = np.prod(env.observation_space.shape)
     action_size = np.prod(env.action_space.shape)
     if args.model_type == 'pytorch':
-        env_model = EnsembleDynamicsModel(args.num_networks, args.num_elites, state_size, action_size, args.reward_size, args.pred_hidden_size,
-                                          use_decay=args.use_decay)
+        env_model = ModularEnsembleRNNDynamicsModel(args.num_networks, args.num_elites, state_size, action_size, args.reward_size, args.pred_hidden_size,
+                                          use_decay=args.use_decay,num_joints = 8)
     else:
         env_model = construct_model(obs_dim=state_size, act_dim=action_size, hidden_dim=args.pred_hidden_size, num_networks=args.num_networks,
                                     num_elites=args.num_elites)

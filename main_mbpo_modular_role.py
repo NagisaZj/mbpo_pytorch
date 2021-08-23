@@ -106,7 +106,7 @@ def readParser():
 
 
 def train(args, env_sampler, predict_env, agent, env_pool, model_pool):
-    writer = SummaryWriter("./logs/modular-role/28")
+    writer = SummaryWriter("./logs/modular-role/42")
     total_step = 0
     reward_sum = 0
     rollout_length = 1

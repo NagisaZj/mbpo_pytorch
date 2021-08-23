@@ -5,3 +5,12 @@ mbpo:
 25: 7 5 100
 26: 5 3 200
 27 28: 7 5 64
+
+mbpo role:
+30 31
+33 34 36(lr) 37(lr swish): fix
+35: no transformer
+40: separate encoder
+modular:
+8
+9: no transformer
